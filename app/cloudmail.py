@@ -112,11 +112,17 @@ class CloudMailClient:
         try:
             with httpx.Client(base_url=self.base_url, transport=self.transport, timeout=self.timeout) as client:
                 response = client.request(method, path, **kwargs)
+        except httpx.RequestError as exc:
+            raise CloudMailError(f"CloudMail 网络请求失败：{exc}") from exc
+        if response.status_code in {401, 403}:
+            # 客户端可能跨请求复用（登录 token 有有效期）；失效后清空缓存，
+            # 让下一次请求重新登录，而不是一直用过期 token 反复失败。
+            self._internal_token = None
+            self._session_token = None
+        try:
             response.raise_for_status()
         except httpx.HTTPStatusError as exc:
             raise CloudMailError(f"CloudMail HTTP 请求失败：{exc.response.status_code}") from exc
-        except httpx.RequestError as exc:
-            raise CloudMailError(f"CloudMail 网络请求失败：{exc}") from exc
 
         try:
             payload = response.json()

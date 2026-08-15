@@ -593,8 +593,9 @@
             method: 'POST',
             headers: { 'X-Requested-With': 'XMLHttpRequest' },
           });
-          const payload = await response.json();
-          if (!response.ok) throw new Error(payload.message || '取消占用失败');
+          let payload = {};
+          try { payload = await response.json(); } catch (_) { /* 网关超时等 HTML 响应 */ }
+          if (!response.ok) throw new Error(payload.message || (response.status >= 500 ? '服务器响应超时或内部错误，请稍后重试' : '取消占用失败'));
 
           const card = document.querySelector('[data-mapping-card="' + button.dataset.id + '"]');
           const status = card?.querySelector('[data-mapping-status]');

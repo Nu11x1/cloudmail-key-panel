@@ -143,6 +143,7 @@
     let claimPendingLabel = '';
     let poller = null;
     let copyToastTimer = null;
+    let refreshing = false;
 
     const readPrivatePreference = () => {
       try { return window.localStorage.getItem(PRIVATE_PREFERENCE_KEY) === 'true'; }
@@ -229,8 +230,21 @@
         headers: { 'X-Requested-With': 'workbench' },
         ...options,
       });
-      const payload = await response.json();
+      let payload = null;
+      try {
+        payload = await response.json();
+      } catch (_) {
+        // 网关超时或服务器异常时可能返回 HTML 页面，这里给出可读提示，
+        // 而不是直接抛出 "Unexpected token '<'" 的 JSON 解析错误。
+      }
       if (!response.ok) {
+        if (!payload) {
+          throw new Error(
+            response.status >= 500
+              ? `服务器响应超时或内部错误（HTTP ${response.status}），请稍后重试`
+              : `请求失败（HTTP ${response.status}），请刷新页面后重试`,
+          );
+        }
         throw new Error(payload.message || payload.error || '请求失败');
       }
       return payload;
@@ -345,12 +359,14 @@
 
     async function refreshLatestCode() {
       if (!currentMapping) return;
+      if (refreshing) return; // 上一次请求还没回来时跳过本次轮询，避免请求堆积
       if (!currentMapping.target_tag_id && !targetTagInput?.value) {
         setMessage('请先选择本次接码平台，再刷新验证码。', 'error');
         targetTagInput?.focus();
         return;
       }
       const requestedMappingId = currentMapping.id;
+      refreshing = true;
       try {
         const category = encodeURIComponent(categoryInput?.value || '');
         const targetTagId = targetTagInput?.value || '';
@@ -364,6 +380,8 @@
           syncActionState();
         }
         if (!currentMapping?.target_tag_id) setMessage(error.message, 'error');
+      } finally {
+        refreshing = false;
       }
     }
 

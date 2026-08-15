@@ -170,3 +170,102 @@ def test_refresh_binds_selected_platform_for_legacy_claim(tmp_path) -> None:
     assert "const targetTagId = targetTagInput?.value || '';" in page.text
     assert "`&target_tag_id=${encodeURIComponent(targetTagId)}`" in page.text
     assert "${targetTagQuery}`" in page.text
+
+
+def test_workbench_ai_extraction_is_cached_across_polls_and_confirm(tmp_path) -> None:
+    """同一封邮件的 AI 提取结果必须跨请求复用，避免每次轮询/确认都重复调用 AI。"""
+
+    import json
+
+    import httpx
+
+    store = KeyStore(tmp_path / "app.db")
+    store.create_tag("未使用", kind="business")
+    platform = store.create_tag("Chatgpt", kind="service", extraction_mode="ai_fallback")
+    cloudmail = WorkbenchMailboxClient()
+    settings = AppSettings(
+        app_secret_key="workbench-ai-cache-test",
+        app_admin_username="admin",
+        app_admin_password="pass123",
+        database_path=str(tmp_path / "app.db"),
+        cloudmail_base_url="https://mail.example.com",
+        cloudmail_api_token="token",
+        verification_extraction_mode="fallback",
+        verification_ai_base_url="https://ai.example.com/v1",
+        verification_ai_api_key="secret-key",
+        verification_ai_model="extract-model",
+    )
+    ai_calls: list[str] = []
+
+    def ai_handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        source = body["messages"][-1]["content"]
+        ai_calls.append(source)
+        code = "AB.12.CD" if "AB.12.CD" in source else ""
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": json.dumps({"code": code})}}]},
+        )
+
+    client = TestClient(
+        create_app(
+            settings=settings,
+            store=store,
+            cloudmail_client=cloudmail,
+            verification_ai_transport=httpx.MockTransport(ai_handler),
+        )
+    )
+    login = client.post(
+        "/admin/login",
+        data={"username": "admin", "password": "pass123"},
+        follow_redirects=False,
+    )
+    assert login.status_code == 303
+
+    mapping = store.create_mapping("ai-cache@icloud.com")
+    claimed = client.post(
+        "/api/workbench/claim-next",
+        data={"target_tag_id": str(platform.id)},
+    )
+    assert claimed.status_code == 200
+    assert claimed.json()["mapping"] is not None
+
+    def message(email_id: int, subject: str) -> CloudMailMessage:
+        return CloudMailMessage(
+            email_id=email_id,
+            send_email="news@openai.com",
+            send_name="OpenAI",
+            subject=subject,
+            to_email=mapping.recipient_email,
+            to_name="",
+            create_time="2099-01-01 00:00:00",
+            type=0,
+            content="",
+            text="some body text",
+            is_del=0,
+        )
+
+    # 新邮件按 email_id 倒序分析：两封无验证码邮件在前，验证码邮件最后命中。
+    cloudmail.messages = [
+        message(1, "Chatgpt verification code: AB.12.CD"),
+        message(2, "OpenAI weekly digest"),
+        message(3, "OpenAI login alert"),
+    ]
+
+    first = client.get("/api/workbench/current/mailbox")
+    assert first.status_code == 200
+    assert first.json()["latest_code"] == "AB.12.CD"
+    calls_after_first = len(ai_calls)
+    assert calls_after_first == 3  # 无码邮件 ×2 + 验证码邮件 ×1
+
+    second = client.get("/api/workbench/current/mailbox")
+    assert second.status_code == 200
+    assert second.json()["latest_code"] == "AB.12.CD"
+    assert len(ai_calls) == calls_after_first  # 同一批邮件不再重复调用 AI
+
+    completed = client.post(
+        "/api/workbench/current/mark-used",
+        data={"mapping_id": mapping.id, "target_tag_id": str(platform.id)},
+    )
+    assert completed.status_code == 200
+    assert len(ai_calls) == calls_after_first  # 确认接码同样复用缓存

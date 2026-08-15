@@ -205,6 +205,61 @@ def test_admin_can_save_cloudmail_settings_and_lookup_uses_saved_token(tmp_path)
     assert fake_factory.configs[-1].internal_admin_password == "secret"
 
 
+def test_cloudmail_client_is_reused_until_credentials_change(tmp_path) -> None:
+    """同一 CloudMail 配置必须复用同一个客户端，避免每个请求都重新登录。"""
+
+    fake_factory = FakeCloudMailFactory()
+    settings = AppSettings(
+        app_secret_key="test-secret",
+        app_admin_username="admin",
+        app_admin_password="pass123",
+        database_path=str(tmp_path / "app.db"),
+        cloudmail_base_url="https://env.example.com",
+        cloudmail_api_token="env-token",
+        lookup_email_limit=5,
+    )
+    app = create_app(settings=settings, cloudmail_client_factory=fake_factory)
+    client = TestClient(app)
+    client.post(
+        "/admin/login",
+        data={"username": "admin", "password": "pass123"},
+        follow_redirects=True,
+    )
+    client.post(
+        "/admin/keys",
+        data={
+            "recipient_email": "buyer@example.com",
+            "query_email": "",
+            "access_key": "reuse-key-1",
+            "label": "reuse",
+        },
+        follow_redirects=True,
+    )
+
+    first = client.get("/mailbox/reuse-key-1")
+    second = client.get("/mailbox/reuse-key-1")
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert len(fake_factory.configs) == 1  # 两次请求只创建一次客户端
+
+    client.post(
+        "/admin/cloudmail",
+        data={
+            "base_url": "https://other.example.com",
+            "api_token": "other-token",
+            "internal_admin_email": "",
+            "internal_admin_password": "",
+            "default_query_email": "",
+            "recent_email_limit": "5",
+            "display_timezone": "UTC",
+        },
+        follow_redirects=True,
+    )
+    third = client.get("/mailbox/reuse-key-1")
+    assert third.status_code == 200
+    assert len(fake_factory.configs) == 2  # 配置变化后按新配置重新创建
+
+
 def test_admin_can_save_ai_extraction_config_without_rendering_api_key(tmp_path) -> None:
     settings = AppSettings(
         app_secret_key="test-secret",

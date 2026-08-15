@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import base64
 import binascii
+import hashlib
 import hmac
 import html
 import json
 import re
 import secrets
+from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -123,6 +125,8 @@ def create_app(
     app.state.fixed_cloudmail_client = cloudmail_client
     app.state.cloudmail_client_factory = cloudmail_client_factory
     app.state.verification_ai_transport = verification_ai_transport
+    app.state.cloudmail_clients = {}
+    app.state.ai_code_cache = OrderedDict()
 
     @app.middleware("http")
     async def authenticate_external_api(request: Request, call_next: Callable[..., Any]) -> Response:
@@ -1937,6 +1941,14 @@ def _get_verification_settings(request: Request) -> VerificationExtractionSettin
     )
 
 
+def _ai_cache_key(subject: str, text: str, html_content: str) -> str:
+    """同一封邮件的 AI 提取结果不会变化，按邮件内容哈希做缓存键。"""
+
+    return hashlib.sha1(
+        f"{subject or ''}\x00{text or ''}\x00{html_content or ''}".encode("utf-8", errors="replace")
+    ).hexdigest()
+
+
 def _get_verification_code_extractor(
     request: Request,
 ) -> Callable[[str, str, str, PlatformRule], list[str]]:
@@ -1951,6 +1963,7 @@ def _get_verification_code_extractor(
             transport=getattr(request.app.state, "verification_ai_transport", None),
         )
     ai_attempts_remaining = 3
+    ai_code_cache = getattr(request.app.state, "ai_code_cache", None)
 
     def extract(subject: str, text: str, html_content: str, rule: PlatformRule) -> list[str]:
         nonlocal ai_attempts_remaining
@@ -1973,12 +1986,34 @@ def _get_verification_code_extractor(
                 return rule_codes
         if ai_attempts_remaining <= 0:
             raise VerificationExtractionError("单次轮询的 AI 提取次数已达上限")
+
+        cache_key = _ai_cache_key(subject, text, html_content)
+        ai_fingerprint = (
+            settings.mode,
+            rule.extraction_mode,
+            custom_patterns,
+            settings.base_url,
+            settings.model,
+            settings.timeout_seconds,
+        )
+        if ai_code_cache is not None:
+            entry = ai_code_cache.get(cache_key)
+            if entry is not None and entry[0] == ai_fingerprint:
+                return list(entry[1])
+
         ai_attempts_remaining -= 1
-        return VerificationCodeExtractor(
+        codes = VerificationCodeExtractor(
             mode="ai_only",
             custom_patterns=custom_patterns,
             ai_extractor=ai_extractor,
         ).extract(subject, text, html_content)
+        # 邮件内容固定，结果不会变化；轮询与确认共用缓存，避免同一封邮件
+        # 每次请求都重新调用 AI。只缓存成功结果，失败（超时/报错）不缓存。
+        if ai_code_cache is not None:
+            ai_code_cache[cache_key] = (ai_fingerprint, tuple(codes))
+            if len(ai_code_cache) > 2000:
+                ai_code_cache.popitem(last=False)
+        return codes
 
     return extract
 
@@ -2046,17 +2081,32 @@ def _get_cloudmail_client(request: Request) -> Any:
     if not has_internal_login and not has_public_access:
         raise CloudMailError("请先填写固定 Token，或填写 CloudMail 管理员邮箱和密码")
 
-    if request.app.state.cloudmail_client_factory is not None:
-        return request.app.state.cloudmail_client_factory(config)
-
-    return CloudMailClient(
-        base_url=config.base_url,
-        admin_email=config.admin_email,
-        admin_password=config.admin_password,
-        api_token=config.api_token,
-        internal_admin_email=config.internal_admin_email,
-        internal_admin_password=config.internal_admin_password,
+    # 同一配置复用同一个客户端：登录 token 在客户端内缓存，避免每个请求都
+    # 重新登录一次 CloudMail（轮询场景下会以 5 秒一次的频率反复打登录接口）。
+    cache = request.app.state.cloudmail_clients
+    cache_key = (
+        config.base_url,
+        config.api_token or "",
+        config.admin_email or "",
+        config.admin_password or "",
+        config.internal_admin_email or "",
+        config.internal_admin_password or "",
     )
+    client = cache.get(cache_key)
+    if client is None:
+        if request.app.state.cloudmail_client_factory is not None:
+            client = request.app.state.cloudmail_client_factory(config)
+        else:
+            client = CloudMailClient(
+                base_url=config.base_url,
+                admin_email=config.admin_email,
+                admin_password=config.admin_password,
+                api_token=config.api_token,
+                internal_admin_email=config.internal_admin_email,
+                internal_admin_password=config.internal_admin_password,
+            )
+        cache[cache_key] = client
+    return client
 
 
 def _translate_store_error(message: str) -> str:
